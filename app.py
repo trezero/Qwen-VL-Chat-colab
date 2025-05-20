@@ -17,6 +17,9 @@ import os
 import re
 import secrets
 import tempfile
+import shutil
+import cv2
+from video_utils import _extract_frames
 from modelscope import (
     AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 )
@@ -205,7 +208,7 @@ Qwen-VL-Chat <a href="https://modelscope.cn/models/qwen/Qwen-VL-Chat/summary">�
         task_history = gr.State([])
 
         with gr.Row():
-            addfile_btn = gr.UploadButton("📁 Upload (上传文件)", file_types=["image"])
+            addfile_btn = gr.UploadButton("📁 Upload (上传文件)", file_types=["image", "video/mp4", "video/avi", "video/quicktime"])
             submit_btn = gr.Button("🚀 Submit (发送)")
             regen_btn = gr.Button("🤔️ Regenerate (重试)")
             empty_bin = gr.Button("🧹 Clear History (清除历史)")
