@@ -3,11 +3,34 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import os
-# os.system('pip install tiktoken')
-# os.system('pip install "modelscope" --upgrade -f https://pypi.org/project/modelscope/')
-# os.system('pip install transformers_stream_generator')
+import sys
+import time
+from pathlib import Path
+import tempfile
+import shutil
+import cv2
+import gradio as gr
+import torch
+from argparse import ArgumentParser
+from modelscope import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, snapshot_download
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+# Set to use only the A6000 (GPU 1)
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
+# Available models with their paths and descriptions
+AVAILABLE_MODELS = {
+    'Qwen-VL-Int4 (4GB VRAM, Faster)': 'Qwen/Qwen-VL-Chat-Int4',
+    'Qwen-VL-Chat (8GB+ VRAM, Better Quality)': 'Qwen/Qwen-VL-Chat',
+    'Qwen1.5-VL-Chat (Latest, 8GB+ VRAM)': 'Qwen/Qwen1.5-VL-Chat',
+}
+
+# Default model
+DEFAULT_MODEL = 'Qwen1.5-VL-Chat (Latest, 8GB+ VRAM)'
+
+# Global variables
+model = None
+tokenizer = None
+current_model_name = None
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -33,11 +56,7 @@ PUNCTUATION = "！？。＂＃＄％＆＇（）＊＋，－／：；＜＝＞�
 
 def _get_args():
     parser = ArgumentParser()
-    parser.add_argument("-c", "--checkpoint-path", type=str, default=DEFAULT_CKPT_PATH,
-                        help="Checkpoint name or path, default to %(default)r")
-    parser.add_argument("--revision", type=str, default=REVISION)
     parser.add_argument("--cpu-only", action="store_true", help="Run demo with CPU only")
-
     parser.add_argument("--share", action="store_true", default=False,
                         help="Create a publicly shareable link for the interface.")
     parser.add_argument("--inbrowser", action="store_true", default=False,
@@ -46,34 +65,69 @@ def _get_args():
                         help="Demo server port.")
     parser.add_argument("--server-name", type=str, default="127.0.0.1",
                         help="Demo server name.")
-
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help=f"Default model to use. Available: {', '.join(AVAILABLE_MODELS.keys())}")
     args = parser.parse_args()
     return args
 
 
-def _load_model_tokenizer(args):
-    model_id = args.checkpoint_path
-    model_dir = snapshot_download(model_id)
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_dir, trust_remote_code=True, resume_download=True,
-    )
+def _load_model_tokenizer(model_name, cpu_only=False):
+    global model, tokenizer, current_model_name
+    
+    if model_name == current_model_name and model is not None and tokenizer is not None:
+        return model, tokenizer
+        
+    print(f"Loading model: {model_name}")
+    start_time = time.time()
+    
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Get the model path from available models
+    model_id = AVAILABLE_MODELS.get(model_name)
+    if not model_id:
+        raise ValueError(f"Model {model_name} not found in available models")
+    
+    try:
+        # Download and load the model
+        model_dir = snapshot_download(model_id)
+        
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_dir, 
+            trust_remote_code=True, 
+            resume_download=True,
+        )
 
-    if args.cpu_only:
-        device_map = "cpu"
-    else:
-        device_map = "auto"
+        # Set device
+        if cpu_only or not torch.cuda.is_available():
+            device_map = "cpu"
+        else:
+            device_map = "auto"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        device_map=device_map,
-        trust_remote_code=True,
-        resume_download=True,
-    ).eval()
-    model.generation_config = GenerationConfig.from_pretrained(
-        model_dir, trust_remote_code=True, resume_download=True,
-    )
-
-    return model, tokenizer
+        # Load model
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            device_map=device_map,
+            trust_remote_code=True,
+            resume_download=True,
+        ).eval()
+        
+        # Load generation config
+        model.generation_config = GenerationConfig.from_pretrained(
+            model_dir, 
+            trust_remote_code=True, 
+            resume_download=True,
+        )
+        
+        current_model_name = model_name
+        print(f"Model loaded in {time.time() - start_time:.2f} seconds")
+        return model, tokenizer
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise
 
 
 def _parse_text(text):
@@ -108,7 +162,7 @@ def _parse_text(text):
     return text
 
 
-def _launch_demo(args, model, tokenizer):
+def _launch_demo(args):
     uploaded_file_dir = os.environ.get("GRADIO_TEMP_DIR") or str(
         Path(tempfile.gettempdir()) / "gradio"
     )
@@ -180,6 +234,23 @@ def _launch_demo(args, model, tokenizer):
         return history, task_history, ""
 
     def add_file(history, task_history, file):
+        # Check if the file is a video
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+        file_ext = os.path.splitext(file.name)[1].lower()
+        
+        if file_ext in video_extensions:
+            # Create a temporary directory for extracted frames
+            temp_dir = tempfile.mkdtemp()
+            # Extract frames from video
+            frame_paths = _extract_frames(file.name, temp_dir)
+            if frame_paths:
+                # Use the first frame for now (you can modify to use more frames)
+                file_path = frame_paths[0]
+                history = history + [((file_path,), None)]
+                task_history = task_history + [((file_path,), None)]
+                return history, task_history
+        
+        # For non-video files or if frame extraction fails, use the file as is
         history = history + [((file.name,), None)]
         task_history = task_history + [((file.name,), None)]
         return history, task_history
@@ -191,57 +262,114 @@ def _launch_demo(args, model, tokenizer):
         task_history.clear()
         return []
 
-    with gr.Blocks() as demo:
+    def load_model(model_name):
+        try:
+            global model, tokenizer
+            model, tokenizer = _load_model_tokenizer(model_name, args.cpu_only)
+            return f"Model loaded: {model_name}"
+        except Exception as e:
+            return f"Error loading model: {str(e)}"
+
+    with gr.Blocks(title="Qwen-VL Chat") as demo:
         gr.Markdown(
             """\
-<center><font size=3>This WebUI is based on Qwen-VL-Chat, developed by Alibaba Cloud. \
-(本WebUI基于Qwen-VL-Chat打造，实现聊天机器人功能。)</center>""")
-        gr.Markdown("""\
-<center><font size=4>Qwen-VL <a href="https://modelscope.cn/models/qwen/Qwen-VL/summary">🤖 </a> 
-| <a href="https://huggingface.co/Qwen/Qwen-VL">🤗</a>&nbsp ｜ 
-Qwen-VL-Chat <a href="https://modelscope.cn/models/qwen/Qwen-VL-Chat/summary">🤖 </a> | 
-<a href="https://huggingface.co/Qwen/Qwen-VL-Chat">🤗</a>&nbsp ｜ 
-&nbsp<a href="https://github.com/QwenLM/Qwen-VL">Github</a></center>""")
-
-        chatbot = gr.Chatbot(label='Qwen-VL-Chat', elem_classes="control-height").style(height=500)
-        query = gr.Textbox(lines=2, label='Input')
-        task_history = gr.State([])
-
-        with gr.Row():
-            addfile_btn = gr.UploadButton("📁 Upload (上传文件)", file_types=["image", "video/mp4", "video/avi", "video/quicktime"])
-            submit_btn = gr.Button("🚀 Submit (发送)")
-            regen_btn = gr.Button("🤔️ Regenerate (重试)")
-            empty_bin = gr.Button("🧹 Clear History (清除历史)")
-
-        submit_btn.click(add_text, [chatbot, task_history, query], [chatbot, task_history]).then(
-            predict, [chatbot, task_history], [chatbot], show_progress=True
+            <center><font size=4>Qwen-VL Chat Demo</font></center>
+            <center><font size=2>Select a model and click 'Load Model' to start chatting</font></center>
+            """
         )
-        submit_btn.click(reset_user_input, [], [query])
-        empty_bin.click(reset_state, [task_history], [chatbot], show_progress=True)
-        regen_btn.click(regenerate, [chatbot, task_history], [chatbot], show_progress=True)
-        addfile_btn.upload(add_file, [chatbot, task_history, addfile_btn], [chatbot, task_history], show_progress=True)
+        
+        with gr.Row():
+            model_dropdown = gr.Dropdown(
+                choices=list(AVAILABLE_MODELS.keys()),
+                value=args.model,
+                label="Select Model",
+                interactive=True
+            )
+            load_btn = gr.Button("Load Model")
+            model_status = gr.Textbox(value="", label="Status", interactive=False)
+        
+        load_btn.click(
+            load_model,
+            inputs=[model_dropdown],
+            outputs=[model_status]
+        )
+        
+        # Only show chat interface after model is loaded
+        with gr.Group(visible=False) as chat_interface:
+            gr.Markdown(
+                """\
+                <center><font size=3>This WebUI is based on Qwen-VL-Chat, developed by Alibaba Cloud. \
+                (本WebUI基于Qwen-VL-Chat打造，实现聊天机器人功能。)</center>"""
+            )
+            gr.Markdown("""\
+                <center><font size=4>Qwen-VL <a href="https://modelscope.cn/models/qwen/Qwen-VL/summary">🤖 </a> 
+                | <a href="https://huggingface.co/Qwen/Qwen-VL">🤗</a>&nbsp ｜ 
+                Qwen-VL-Chat <a href="https://modelscope.cn/models/qwen/Qwen-VL-Chat/summary">🤖 </a> | 
+                <a href="https://huggingface.co/Qwen/Qwen-VL-Chat">🤗</a>&nbsp ｜ 
+                &nbsp<a href="https://github.com/QwenLM/Qwen-VL">Github</a></center>"""
+            )
 
-        gr.Markdown("""\
-<font size=2>Note: This demo is governed by the original license of Qwen-VL. \
-We strongly advise users not to knowingly generate or allow others to knowingly generate harmful content, \
-including hate speech, violence, pornography, deception, etc. \
-(注：本演示受Qwen-VL的许可协议限制。我们强烈建议，用户不应传播及不应允许他人传播以下内容，\
-包括但不限于仇恨言论、暴力、色情、欺诈相关的有害信息。)""")
+            chatbot = gr.Chatbot(label='Qwen-VL-Chat', height=500, elem_classes=["control-height"])
+            query = gr.Textbox(lines=2, label='Input')
+            task_history = gr.State([])
 
-    demo.queue().launch(
-        share=args.share,
-        inbrowser=args.inbrowser,
-        server_port=args.server_port,
+            with gr.Row():
+                addfile_btn = gr.UploadButton("📁 Upload (上传文件)", file_types=["image", "video/mp4", "video/avi", "video/quicktime"])
+                submit_btn = gr.Button("🚀 Submit (发送)")
+                regen_btn = gr.Button("🤔️ Regenerate (重试)")
+                empty_bin = gr.Button("🧹 Clear History (清除历史)")
+
+            submit_btn.click(add_text, [chatbot, task_history, query], [chatbot, task_history]).then(
+                predict, [chatbot, task_history], [chatbot], show_progress=True
+            )
+            submit_btn.click(reset_user_input, [], [query])
+            empty_bin.click(reset_state, [task_history], [chatbot], show_progress=True)
+            regen_btn.click(regenerate, [chatbot, task_history], [chatbot], show_progress=True)
+            addfile_btn.upload(add_file, [chatbot, task_history, addfile_btn], [chatbot, task_history], show_progress=True)
+
+            gr.Markdown("""\
+                <font size=2>Note: This demo is governed by the original license of Qwen-VL. \
+                We strongly advise users not to knowingly generate or allow others to knowingly generate harmful content, \
+                including hate speech, violence, pornography, deception, etc. \
+                (注：本演示受Qwen-VL的许可协议限制。我们强烈建议，用户不应传播及不应允许他人传播以下内容，\
+                包括但不限于仇恨言论、暴力、色情、欺诈相关的有害信息。)"""
+            )
+
+        # Load the default model at startup
+        demo.load(
+            fn=load_model,
+            inputs=[model_dropdown],
+            outputs=[model_status],
+            queue=False
+        )
+        
+        # Toggle chat interface visibility based on model loading
+        def toggle_chat_interface(model_status):
+            if model_status and "loaded" in model_status.lower():
+                return gr.Group(visible=True)
+            return gr.Group(visible=False)
+        
+        demo.load(
+            fn=toggle_chat_interface,
+            inputs=[model_status],
+            outputs=[chat_interface],
+            queue=False
+        )
+    
+    # Enable sharing and set server configuration
+    demo.queue(max_size=100).launch(
+        share=True,  # Always enable sharing to handle localhost access issues
         server_name=args.server_name,
+        server_port=args.server_port,
+        inbrowser=not args.no_auto_launch,
+        max_threads=200,
+        debug=True
     )
 
 
 def main():
     args = _get_args()
-
-    model, tokenizer = _load_model_tokenizer(args)
-
-    _launch_demo(args, model, tokenizer)
+    _launch_demo(args)
 
 
 if __name__ == '__main__':
